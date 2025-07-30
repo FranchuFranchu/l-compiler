@@ -1,0 +1,10 @@
+[package]
+name = "l-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift = "0.118.0"
+cranelift-module = "0.118.0"
+cranelift-jit = "0.118.0"
+cranelift-native = "0.118.0"

@@ -370,20 +370,28 @@ impl<'a> FunctionCompiler<'a> {
                 let mut size = self
                     .builder
                     .ins()
-                    .iconst(self.value_type, t.value_count() as i64);
+                    .iconst(self.value_type, t.value_count() as i64 + 1);
                 self.decrement_rc(&mut buffer, &mut size);
                 self.compile_command(command);
             }
             Command::Unbox(name, command) => {
                 let expr = self.vars.remove(name).unwrap();
-                let LangValue::Box(buffer, t) = expr else {
+                let LangValue::Box(mut buffer, t) = expr else {
                     unreachable!("{:?}", expr,);
                 };
                 let value = self.fill_from_type(
                     &t,
-                    &mut ValueIterator::Buffer::<std::iter::Empty<_>>(buffer, 0),
+                    &mut ValueIterator::Buffer::<std::iter::Empty<_>>(
+                        buffer,
+                        self.value_type.bytes() as i32,
+                    ),
                 );
+                let mut size = self
+                    .builder
+                    .ins()
+                    .iconst(self.value_type, t.value_count() as i64 + 1);
                 self.vars.insert(name.clone(), value);
+                self.decrement_rc(&mut buffer, &mut size);
                 self.compile_command(command);
             }
             Command::Duplicate(name, name2, command) => {
@@ -627,6 +635,8 @@ impl<'a> FunctionCompiler<'a> {
             .brif(rc, else_block, ctx_args.iter(), free_block, ctx_args.iter());
         for _ in 0..ctx_args.len() {
             self.builder.append_block_param(free_block, self.value_type);
+        }
+        for _ in 0..ctx_args.len() {
             self.builder.append_block_param(else_block, self.value_type);
         }
 
@@ -923,6 +933,7 @@ extern "C" fn alloc(mut allocator: usize, size: usize) -> TwoUsize {
 }
 extern "C" fn free(allocator: usize, pointer: *mut u8, size: usize) -> usize {
     use std::alloc::{Layout, dealloc};
+    println!("freed");
     let layout = Layout::from_size_align(size, 8).unwrap();
     unsafe {
         dealloc(pointer, layout);
@@ -977,26 +988,8 @@ pub fn main() {
     };
     // (par () (" ") ((name . "b") (type . unit)) (cut (var . "a") (var . "b")))
 
-    let closure: Result<Expression, serde_lexpr::Error> = serde_lexpr::from_str(
-        r#"
-(chan () ("user" (pair (either unit unit) (pair (either unit unit) (dual . (either unit unit))))) (receive "user" "a" (receive "user" "b"
-    (match "a"
-        (continue "a"
-            (match "b"
-                (continue "b"
-                    (cut (var . "user") (left unit unit))
-                )
-                (continue "b"
-                    (cut (var . "user") (left unit unit))
-                )
-            )
-        )
-        (continue "a"
-           (cut (var . "user") (var . "b"))
-        )
-    )
-)))"#,
-    );
+    let closure: Result<Expression, serde_lexpr::Error> =
+        serde_lexpr::from_str(include_str!("../dup3.l"));
     let Ok(mut closure) = closure else {
         let e = closure.unwrap_err();
         panic!("parsing error {:?} {}", e.location(), e);
@@ -1007,25 +1000,30 @@ pub fn main() {
     };
 
     type Allocator = i64;
-    let func_id = compiler.sysv_to_internal_entry_point::<2, 1>(&func_id);
+    let func_id = compiler.sysv_to_internal_entry_point::<1, 2>(&func_id);
     compiler.module.finalize_definitions().unwrap();
 
     let func = unsafe {
         // Allocator, their_captures, return_buffer, in0, in1
-        std::mem::transmute::<_, extern "C" fn(Allocator, *const u8, *mut [i64; 2], i64, i64)>(
+        std::mem::transmute::<_, extern "C" fn(Allocator, *const u8, *mut [i64; 3], i64)>(
             compiler.module.get_finalized_function(func_id),
         )
     };
     println!("{:p}", func);
     let allocator = 0;
-    let mut output_buffer: Box<[i64; 2]> = Box::new([1, 2]);
-    let output_buffer_p = output_buffer.as_mut() as *mut [i64; 2];
+    let mut input = alloc(0, 3 * 8) >> 64;
+    unsafe { *(input as *mut [i64; 2]).as_mut().unwrap() = [1, 1] }
+
+    let mut output_buffer: Box<[i64; 3]> = Box::new([1, 0, 0]);
+    let output_buffer_p = output_buffer.as_mut() as *mut [i64; 3];
     func(
         allocator,
         output_buffer_p as *const u8,
         output_buffer_p as _,
-        0,
-        0,
+        input as i64,
     );
+    println!("{:?}", unsafe {
+        (input as *mut [i64; 2]).as_mut().unwrap()
+    });
     println!("{:?}", output_buffer);
 }

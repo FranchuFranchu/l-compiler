@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use abi::LangBox;
 use cranelift::{
     codegen::{
         Context,
@@ -16,6 +17,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use serde_derive::{Deserialize, Serialize};
 
+pub mod abi;
+
 pub type ContextBlueprint = BTreeMap<String, LangValue>;
 
 // A LangValue represents a single L value
@@ -26,8 +29,8 @@ pub enum LangValue {
     Unit,
     // func_addr, captures_buffer
     Closure(Value, Value, Type),
-    // func_addr, captures_buffer
-    BoxClosure(Value, Value, Type),
+    // func_addr, captures_buffer, buffer_len
+    BoxClosure(Value, Value, Value, Type),
     // buffer
     Box(Value, Type),
     Heap(Value),
@@ -115,7 +118,9 @@ impl LangValue {
             LangValue::Either(_, _, a, b) => Type::Either(Box::new(a.clone()), Box::new(b.clone())),
             LangValue::Unit => Type::Unit,
             LangValue::Closure(_, _, t) => Type::Dual(Box::new(t.clone())),
-            LangValue::BoxClosure(_, _, t) => Type::Box(Box::new(Type::Dual(Box::new(t.clone())))),
+            LangValue::BoxClosure(_, _, _, t) => {
+                Type::Box(Box::new(Type::Dual(Box::new(t.clone()))))
+            }
             LangValue::Heap(_) => todo!(),
             LangValue::Box(_, t) => t.clone(),
         }
@@ -128,7 +133,7 @@ impl LangValue {
             }
             LangValue::Unit => vec![],
             LangValue::Closure(a, b, _) => vec![a.clone(), b.clone()],
-            LangValue::BoxClosure(a, b, _) => vec![a.clone(), b.clone()],
+            LangValue::BoxClosure(a, b, c, _) => vec![a.clone(), b.clone(), c.clone()],
             LangValue::Heap(value) => vec![value.clone()],
             LangValue::Box(value, _) => vec![value.clone()],
         }
@@ -150,9 +155,10 @@ impl LangValue {
                 *a = iter.next().unwrap();
                 *b = iter.next().unwrap();
             }
-            LangValue::BoxClosure(a, b, _) => {
+            LangValue::BoxClosure(a, b, c, _) => {
                 *a = iter.next().unwrap();
                 *b = iter.next().unwrap();
+                *c = iter.next().unwrap();
             }
             LangValue::Heap(value) => {
                 *value = iter.next().unwrap();
@@ -261,8 +267,11 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 offset += value_bytes as usize;
             }
-            let val =
-                this.fill_from_type(&var.r#type, &mut ValueIterator::ValueList(vals.into_iter()));
+            let val = this.fill_from_type(
+                &var.r#type,
+                &mut ValueIterator::ValueList(vals.into_iter()),
+                false,
+            );
             this.vars.insert(var.name, val);
         }
 
@@ -270,7 +279,11 @@ impl<'a> FunctionCompiler<'a> {
         this.emit_free_const(captures_buffer, value_count as i64);
         let it = Vec::from(&this.builder.block_params(entry_block)[2..]);
 
-        let val = this.fill_from_type(&input_type, &mut ValueIterator::ValueList(it.into_iter()));
+        let val = this.fill_from_type(
+            &input_type,
+            &mut ValueIterator::ValueList(it.into_iter()),
+            false,
+        );
         (this, val)
     }
     fn close(self) -> FuncId {
@@ -281,8 +294,8 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_command(&mut self, command: &Command) {
         match command {
             Command::Cut(a, b) => {
-                let a = self.compile_expression(a);
-                let b = self.compile_expression(b);
+                let a = self.compile_expression(a, false);
+                let b = self.compile_expression(b, false);
                 match (a, b) {
                     (LangValue::Closure(function, closure, t), arg)
                     | (arg, LangValue::Closure(function, closure, t)) => {
@@ -356,6 +369,7 @@ impl<'a> FunctionCompiler<'a> {
                     let input_value = self.fill_from_type(
                         &input_type,
                         &mut ValueIterator::ValueList(values.into_iter()),
+                        false,
                     );
                     self.vars.insert(name.clone(), input_value);
 
@@ -385,6 +399,7 @@ impl<'a> FunctionCompiler<'a> {
                         buffer,
                         self.value_type.bytes() as i32,
                     ),
+                    true,
                 );
                 let mut size = self
                     .builder
@@ -412,8 +427,9 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         e: &Expression,
         t_b: Type,
+        boxed: bool,
     ) -> (Vec<Value>, Type, Type) {
-        let e = self.compile_expression(e);
+        let e = self.compile_expression(e, boxed);
         let t_a = e.infer();
         let mut values = vec![];
         for _ in 0..(t_b.value_count() - t_a.value_count()).max(0) {
@@ -421,16 +437,17 @@ impl<'a> FunctionCompiler<'a> {
         }
         (values, t_a, t_b)
     }
-    fn compile_expression(&mut self, expression: &Expression) -> LangValue {
+    fn compile_expression(&mut self, expression: &Expression, boxed: bool) -> LangValue {
         match expression {
             Expression::Var(name) => self.vars.remove(name).unwrap(),
             Expression::Unit => LangValue::Unit,
             Expression::Pair(fst, snd) => LangValue::Pair(
-                Box::new(self.compile_expression(fst)),
-                Box::new(self.compile_expression(snd)),
+                Box::new(self.compile_expression(fst, boxed)),
+                Box::new(self.compile_expression(snd, boxed)),
             ),
             Expression::Left(e, other) => {
-                let (values, t_a, t_b) = self.compile_expression_and_pad_to(e, other.clone());
+                let (values, t_a, t_b) =
+                    self.compile_expression_and_pad_to(e, other.clone(), boxed);
                 LangValue::Either(
                     self.builder.ins().iconst(self.value_type, 0),
                     values,
@@ -439,7 +456,8 @@ impl<'a> FunctionCompiler<'a> {
                 )
             }
             Expression::Right(e, other) => {
-                let (values, t_b, t_a) = self.compile_expression_and_pad_to(e, other.clone());
+                let (values, t_b, t_a) =
+                    self.compile_expression_and_pad_to(e, other.clone(), boxed);
                 LangValue::Either(
                     self.builder.ins().iconst(self.value_type, 1),
                     values,
@@ -454,14 +472,21 @@ impl<'a> FunctionCompiler<'a> {
                     .declare_func_in_func(*func_id, &mut self.builder.func);
 
                 // emit alloc call
-                let size = captures
-                    .0
-                    .iter()
-                    .map(|x| x.r#type.value_count())
-                    .sum::<usize>();
+                let mut size = captures.value_count();
+
+                if boxed {
+                    size += 1
+                }
                 //let size = self.builder.ins().iconst(self.value_type, size as i64);
                 let captures_p = self.emit_alloc_const(size as i64);
                 let mut offset = 0i32;
+                if boxed {
+                    let initial_rc = self.builder.ins().iconst(self.value_type, 1);
+                    self.builder
+                        .ins()
+                        .store(MemFlags::trusted(), initial_rc, captures_p, offset);
+                    offset += self.value_type.bytes() as i32;
+                }
                 for i in &captures.0 {
                     let val = self.vars.remove(&i.name).unwrap();
                     for val in val.values() {
@@ -472,14 +497,23 @@ impl<'a> FunctionCompiler<'a> {
                     }
                 }
 
-                LangValue::Closure(
-                    self.builder.ins().func_addr(self.value_type, fun_ref),
-                    captures_p,
-                    input_type.clone(),
-                )
+                if boxed {
+                    LangValue::BoxClosure(
+                        self.builder.ins().func_addr(self.value_type, fun_ref),
+                        captures_p,
+                        self.builder.ins().iconst(self.value_type, size as i64),
+                        input_type.clone(),
+                    )
+                } else {
+                    LangValue::Closure(
+                        self.builder.ins().func_addr(self.value_type, fun_ref),
+                        captures_p,
+                        input_type.clone(),
+                    )
+                }
             }
             Expression::Box(captures, expr) => {
-                let expr = self.compile_expression(expr);
+                let expr = self.compile_expression(expr, true);
                 let t = expr.infer();
                 let values = expr.values();
                 let buffer = self.emit_alloc_const((values.len() + 1) as i64);
@@ -559,13 +593,14 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         typ: &Type,
         values: &mut ValueIterator<T>,
+        boxed: bool,
     ) -> LangValue {
         match typ {
             Type::Unit => LangValue::Unit,
             Type::Zero => unreachable!(),
             Type::Pair(a, b) => LangValue::Pair(
-                Box::new(self.fill_from_type(a, values)),
-                Box::new(self.fill_from_type(b, values)),
+                Box::new(self.fill_from_type(a, values, boxed)),
+                Box::new(self.fill_from_type(b, values, boxed)),
             ),
             Type::Either(a, b) => LangValue::Either(
                 self.next_value(values),
@@ -579,11 +614,22 @@ impl<'a> FunctionCompiler<'a> {
                 a.as_ref().clone(),
                 b.as_ref().clone(),
             ),
-            Type::Dual(u) => LangValue::Closure(
-                self.next_value(values),
-                self.next_value(values),
-                u.as_ref().clone(),
-            ),
+            Type::Dual(u) => {
+                if boxed {
+                    LangValue::BoxClosure(
+                        self.next_value(values),
+                        self.next_value(values),
+                        self.next_value(values),
+                        u.as_ref().clone(),
+                    )
+                } else {
+                    LangValue::Closure(
+                        self.next_value(values),
+                        self.next_value(values),
+                        u.as_ref().clone(),
+                    )
+                }
+            }
             Type::Box(u) => LangValue::Box(self.next_value(values), u.as_ref().clone()),
         }
     }
@@ -680,18 +726,18 @@ enum ValueIterator<T: Iterator<Item = Value>> {
 
 impl Compiler {
     // These two functions compile all child closures of an expression or command
-    fn compile_expression_children(&mut self, expression: &mut Expression) {
+    fn compile_expression_children(&mut self, expression: &mut Expression, boxed: bool) {
         match expression {
             Expression::Unit => {}
             Expression::Pair(a, b) => {
-                self.compile_expression_children(a);
-                self.compile_expression_children(b);
+                self.compile_expression_children(a, boxed);
+                self.compile_expression_children(b, boxed);
             }
             Expression::Left(a, _) => {
-                self.compile_expression_children(a);
+                self.compile_expression_children(a, boxed);
             }
             Expression::Right(b, _) => {
-                self.compile_expression_children(b);
+                self.compile_expression_children(b, boxed);
             }
             mut e @ Expression::Chan(..) => {
                 let Expression::Chan(captures, var, command) = &mut e else {
@@ -730,8 +776,8 @@ impl Compiler {
     fn compile_command_children(&mut self, command: &mut Command) {
         match command {
             Command::Cut(a, b) => {
-                self.compile_expression_children(a);
-                self.compile_expression_children(b);
+                self.compile_expression_children(a, false);
+                self.compile_expression_children(b, false);
             }
             Command::Match(_, lft, rgt) => {
                 self.compile_command_children(lft);
@@ -918,7 +964,7 @@ pub type TwoUsize = u128;
 #[cfg(target_pointer_width = "32")]
 pub type TwoUsize = u64;
 
-extern "C" fn alloc(mut allocator: usize, size: usize) -> TwoUsize {
+pub extern "C" fn alloc(mut allocator: usize, size: usize) -> TwoUsize {
     // we don't use the allocator param right now
     // simply increment it
     use std::alloc::{Layout, alloc};
@@ -931,7 +977,7 @@ extern "C" fn alloc(mut allocator: usize, size: usize) -> TwoUsize {
     #[cfg(target_pointer_width = "32")]
     return allocator as u32 | (ptr.expose_provenance() as u32) << 64;
 }
-extern "C" fn free(allocator: usize, pointer: *mut u8, size: usize) -> usize {
+pub extern "C" fn free(allocator: usize, pointer: *mut u8, size: usize) -> usize {
     use std::alloc::{Layout, dealloc};
     println!("freed");
     let layout = Layout::from_size_align(size, 8).unwrap();
@@ -994,7 +1040,7 @@ pub fn main() {
         let e = closure.unwrap_err();
         panic!("parsing error {:?} {}", e.location(), e);
     };
-    compiler.compile_expression_children(&mut closure);
+    compiler.compile_expression_children(&mut closure, true);
     let Expression::CompiledChannel(captures, func_id, typ) = closure else {
         unreachable!()
     };
@@ -1009,21 +1055,25 @@ pub fn main() {
             compiler.module.get_finalized_function(func_id),
         )
     };
-    println!("{:p}", func);
-    let allocator = 0;
-    let mut input = alloc(0, 3 * 8) >> 64;
-    unsafe { *(input as *mut [i64; 2]).as_mut().unwrap() = [1, 1] }
 
-    let mut output_buffer: Box<[i64; 3]> = Box::new([1, 0, 0]);
-    let output_buffer_p = output_buffer.as_mut() as *mut [i64; 3];
+    pub type InputType = LangBox<Result<(), ()>>;
+    pub type OutputType = LangBox<Result<(), ()>>;
+
+    let allocator = 0;
+    use crate::abi::Abi;
+    let input_value = LangBox::new(Result::<(), ()>::Err(()));
+    let mut input_buffer = vec![0usize; InputType::size()].into_boxed_slice();
+    input_value.serialize(&mut input_buffer).unwrap();
+    let mut output_buffer = vec![0usize; OutputType::size()].into_boxed_slice();
+    let mut output_buffer = output_buffer.as_mut_ptr();
     func(
         allocator,
-        output_buffer_p as *const u8,
-        output_buffer_p as _,
-        input as i64,
+        0 as _,
+        output_buffer as _,
+        input_buffer[0] as i64,
     );
-    println!("{:?}", unsafe {
-        (input as *mut [i64; 2]).as_mut().unwrap()
-    });
-    println!("{:?}", output_buffer);
+    let mut output_buffer =
+        unsafe { std::slice::from_raw_parts(output_buffer, OutputType::size() + 1) };
+    let output = unsafe { OutputType::deserialize(&output_buffer[1..]) };
+    println!("{:?}", output);
 }

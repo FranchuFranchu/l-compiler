@@ -3,6 +3,8 @@
 // - explicit types
 // - explicit joy :D
 
+pub mod parse;
+
 use std::collections::BTreeMap;
 
 use abi::LangBox;
@@ -1034,12 +1036,11 @@ pub fn main() {
     };
     // (par () (" ") ((name . "b") (type . unit)) (cut (var . "a") (var . "b")))
 
-    let closure: Result<Expression, serde_lexpr::Error> =
-        serde_lexpr::from_str(include_str!("../dup3.l"));
-    let Ok(mut closure) = closure else {
-        let e = closure.unwrap_err();
-        panic!("parsing error {:?} {}", e.location(), e);
-    };
+    let mut closure: Expression =
+        Expression::from_lexpr(&lexpr::from_str(include_str!("../dup3.l")).unwrap()).unwrap();
+
+    println!("{closure:#?}");
+
     compiler.compile_expression_children(&mut closure, true);
     let Expression::CompiledChannel(captures, func_id, typ) = closure else {
         unreachable!()

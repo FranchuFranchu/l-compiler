@@ -1,3 +1,5 @@
+#![feature(box_patterns)]
+
 // this loads a file with:
 // - explicit captures
 // - explicit types
@@ -5,15 +7,18 @@
 
 pub mod parse;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use abi::LangBox;
+use abi::{RawHandle, VMCtx, VMCtxInner, alloc_abi_compatible, free_abi_compatible};
 use cranelift::{
     codegen::{
         Context,
-        ir::{self, BlockArg, FuncRef},
+        ir::{self, AbiParam, BlockArg, FuncRef, Signature},
     },
-    prelude::{isa::CallConv, *},
+    prelude::{
+        Configurable, FunctionBuilder, FunctionBuilderContext, InstBuilder, MemFlags,
+        StackSlotData, StackSlotKind, Value, Variable, isa, isa::CallConv, settings,
+    },
 };
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -31,8 +36,9 @@ pub enum LangValue {
     Unit,
     // func_addr, captures_buffer
     Closure(Value, Value, Type),
-    // func_addr, captures_buffer, buffer_len
-    BoxClosure(Value, Value, Value, Type),
+    // func_addr, captures_buffer
+    // captures_buffer contains rc, buffer_len, and then the actual amount of captures
+    BoxClosure(Value, Value, Type),
     // buffer
     Box(Value, Type),
     Heap(Value),
@@ -120,9 +126,7 @@ impl LangValue {
             LangValue::Either(_, _, a, b) => Type::Either(Box::new(a.clone()), Box::new(b.clone())),
             LangValue::Unit => Type::Unit,
             LangValue::Closure(_, _, t) => Type::Dual(Box::new(t.clone())),
-            LangValue::BoxClosure(_, _, _, t) => {
-                Type::Box(Box::new(Type::Dual(Box::new(t.clone()))))
-            }
+            LangValue::BoxClosure(_, _, t) => Type::Box(Box::new(Type::Dual(Box::new(t.clone())))),
             LangValue::Heap(_) => todo!(),
             LangValue::Box(_, t) => t.clone(),
         }
@@ -135,7 +139,7 @@ impl LangValue {
             }
             LangValue::Unit => vec![],
             LangValue::Closure(a, b, _) => vec![a.clone(), b.clone()],
-            LangValue::BoxClosure(a, b, c, _) => vec![a.clone(), b.clone(), c.clone()],
+            LangValue::BoxClosure(a, b, _) => vec![a.clone(), b.clone()],
             LangValue::Heap(value) => vec![value.clone()],
             LangValue::Box(value, _) => vec![value.clone()],
         }
@@ -157,10 +161,9 @@ impl LangValue {
                 *a = iter.next().unwrap();
                 *b = iter.next().unwrap();
             }
-            LangValue::BoxClosure(a, b, c, _) => {
+            LangValue::BoxClosure(a, b, _) => {
                 *a = iter.next().unwrap();
                 *b = iter.next().unwrap();
-                *c = iter.next().unwrap();
             }
             LangValue::Heap(value) => {
                 *value = iter.next().unwrap();
@@ -193,6 +196,8 @@ pub struct Compiler {
     pre_ctx: BTreeMap<String, Type>,
     alloc: Option<FuncId>,
     free: Option<FuncId>,
+    entry_trampolines: HashMap<usize, FuncId>,
+    exit_trampolines: HashMap<usize, FuncId>,
 }
 
 pub struct FunctionCompiler<'a> {
@@ -503,7 +508,6 @@ impl<'a> FunctionCompiler<'a> {
                     LangValue::BoxClosure(
                         self.builder.ins().func_addr(self.value_type, fun_ref),
                         captures_p,
-                        self.builder.ins().iconst(self.value_type, size as i64),
                         input_type.clone(),
                     )
                 } else {
@@ -619,7 +623,6 @@ impl<'a> FunctionCompiler<'a> {
             Type::Dual(u) => {
                 if boxed {
                     LangValue::BoxClosure(
-                        self.next_value(values),
                         self.next_value(values),
                         self.next_value(values),
                         u.as_ref().clone(),
@@ -871,68 +874,33 @@ impl Compiler {
 
         func_id
     }
-    /// Generate a system V abi function that calls an VM function
-    ///
-    fn sysv_to_internal_entry_point<const N: u32, const M: u32>(
-        &mut self,
-        vm_id: &FuncId,
-    ) -> FuncId {
+
+    // entry trampolines take in:
+    // allocator, closure_addr, closure_state, pointer_to_args
+    fn entry_trampoline(&mut self, n: usize) -> FuncId {
         let pointer_type = self.module.isa().pointer_type();
 
-        // Generate the return closure, which sets the return variables the output buffer and returns
-        let mut ret_signature = Signature::new(CallConv::Tail);
-        for _ in 0..(M + 2) {
-            ret_signature.params.push(AbiParam::new(pointer_type));
+        if let Some(e) = self.entry_trampolines.get(&n) {
+            return e.clone();
         }
 
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.f_ctx);
-        let ret_func_id = self
-            .module
-            .declare_anonymous_function(&ret_signature)
-            .unwrap();
-        builder.func.signature = ret_signature;
-
-        let entry_block = builder.create_block();
-        builder.append_block_params_for_function_params(entry_block);
-        builder.switch_to_block(entry_block);
-        builder.seal_block(entry_block);
-        let allocator = builder.block_params(entry_block)[0];
-        let captures = builder.block_params(entry_block)[1];
-        let output = Vec::from(&builder.block_params(entry_block)[2..]);
-        let mut offset = 0i32;
-        builder
-            .ins()
-            .store(MemFlags::trusted(), allocator, captures, offset);
-
-        offset += pointer_type.bytes() as i32;
-        for i in 0..M {
-            builder
-                .ins()
-                .store(MemFlags::trusted(), output[i as usize], captures, offset);
-            offset += pointer_type.bytes() as i32;
+        let mut target_signature = Signature::new(CallConv::Tail);
+        for _ in 0..(n + 2) {
+            target_signature.params.push(AbiParam::new(pointer_type));
         }
-        builder.ins().return_(&[]);
-        builder.finalize();
-        println!("Ret trampoline:\n{}", &self.ctx.func);
-        self.module
-            .define_function(ret_func_id, &mut self.ctx)
-            .unwrap();
-        self.module.clear_context(&mut self.ctx);
 
         let mut signature = Signature::new(CallConv::SystemV);
         // allocator
-        // captures
-        // output buffer
-        for _ in 0..(N + 3) {
+        // closure_addr
+        // closure_state
+        for _ in 0..(n + 3) {
             signature.params.push(AbiParam::new(pointer_type));
         }
 
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.f_ctx);
         let func_id = self.module.declare_anonymous_function(&signature).unwrap();
         builder.func.signature = signature;
-
-        let ret_func_ref = self.module.declare_func_in_func(ret_func_id, builder.func);
-        let vm_func_ref = self.module.declare_func_in_func(*vm_id, builder.func);
+        let sig_ref = builder.import_signature(target_signature);
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -941,53 +909,129 @@ impl Compiler {
 
         let mut args = vec![
             builder.block_params(entry_block)[0],
-            builder.block_params(entry_block)[1],
+            builder.block_params(entry_block)[2],
         ];
+        let func_addr = builder.block_params(entry_block)[1];
+        let input_buffer = builder.block_params(entry_block)[3];
 
-        args.append(&mut Vec::from(&builder.block_params(entry_block)[3..]));
-        args.push(builder.ins().func_addr(pointer_type, ret_func_ref)); // ret continuation address
-        args.push(builder.block_params(entry_block)[2]); // output buffer = ret continuation captures
-
-        builder.ins().call(vm_func_ref, &args);
+        for i in 0..n {
+            args.push(builder.ins().load(
+                pointer_type,
+                MemFlags::trusted(),
+                input_buffer,
+                (pointer_type.bytes() * i as u32) as i32,
+            ))
+        }
+        builder.ins().call_indirect(sig_ref, func_addr, &args);
         builder.ins().return_(&[]);
 
         builder.finalize();
 
-        println!("Entry:\n{}", &self.ctx.func);
+        println!("Entry trampoline for n = {n}:\n{}", &self.ctx.func);
         self.module.define_function(func_id, &mut self.ctx).unwrap();
         self.module.clear_context(&mut self.ctx);
 
+        self.entry_trampolines.insert(n, func_id);
         func_id
     }
-}
+    // exit trampolines take in:
+    // allocator, closure_state ( output buffer ), args...
+    fn exit_trampoline(&mut self, m: usize) -> FuncId {
+        let pointer_type = self.module.isa().pointer_type();
 
-#[cfg(target_pointer_width = "64")]
-pub type TwoUsize = u128;
-#[cfg(target_pointer_width = "32")]
-pub type TwoUsize = u64;
+        if let Some(e) = self.exit_trampolines.get(&m) {
+            return e.clone();
+        }
 
-pub extern "C" fn alloc(mut allocator: usize, size: usize) -> TwoUsize {
-    // we don't use the allocator param right now
-    // simply increment it
-    use std::alloc::{Layout, alloc};
-    let layout = Layout::from_size_align(size, 8).unwrap();
-    let ptr = unsafe { alloc(layout) };
-    allocator += 1;
+        let mut signature = Signature::new(CallConv::Tail);
+        for _ in 0..(m + 2) {
+            signature.params.push(AbiParam::new(pointer_type));
+        }
 
-    #[cfg(target_pointer_width = "64")]
-    return allocator as u128 | (ptr.expose_provenance() as u128) << 64;
-    #[cfg(target_pointer_width = "32")]
-    return allocator as u32 | (ptr.expose_provenance() as u32) << 64;
-}
-pub extern "C" fn free(allocator: usize, pointer: *mut u8, size: usize) -> usize {
-    use std::alloc::{Layout, dealloc};
-    println!("freed");
-    let layout = Layout::from_size_align(size, 8).unwrap();
-    unsafe {
-        dealloc(pointer, layout);
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.f_ctx);
+        let func_id = self.module.declare_anonymous_function(&signature).unwrap();
+        builder.func.signature = signature;
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+        let allocator = builder.block_params(entry_block)[0];
+        let captures = builder.block_params(entry_block)[1];
+        let output = Vec::from(&builder.block_params(entry_block)[2..]);
+        let alloc = self
+            .module
+            .declare_func_in_func(self.alloc.unwrap(), builder.func);
+
+        let active_buf = builder
+            .ins()
+            .load(pointer_type, MemFlags::trusted(), captures, 0);
+        let callback_id = builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            captures,
+            pointer_type.bytes() as i32,
+        );
+
+        let size = (m + 2) * pointer_type.bytes() as usize;
+        let size = builder.ins().iconst(pointer_type, size as i64);
+        let call = builder.ins().call(alloc, &[allocator, size]);
+        let call = builder.inst_results(call);
+        let allocator = call[0];
+        let output_buffer = call[1];
+
+        let mut offset = 0i32;
+        builder
+            .ins()
+            .store(MemFlags::trusted(), allocator, output_buffer, offset);
+        offset += pointer_type.bytes() as i32;
+        builder
+            .ins()
+            .store(MemFlags::trusted(), callback_id, output_buffer, offset);
+        offset += pointer_type.bytes() as i32;
+        for i in 0..m {
+            builder.ins().store(
+                MemFlags::trusted(),
+                output[i as usize],
+                output_buffer,
+                offset,
+            );
+            offset += pointer_type.bytes() as i32;
+        }
+
+        builder
+            .ins()
+            .store(MemFlags::trusted(), output_buffer, active_buf, 0);
+        builder.ins().return_(&[]);
+
+        builder.finalize();
+        println!("Exit trampoline for m = {m}:\n{}", &self.ctx.func);
+        self.module.define_function(func_id, &mut self.ctx).unwrap();
+        self.module.clear_context(&mut self.ctx);
+
+        self.exit_trampolines.insert(m, func_id);
+        func_id
     }
-    allocator
+
+    fn entry_trampoline_finalized(
+        &mut self,
+        n: usize,
+    ) -> unsafe extern "C" fn(usize, *const u8, *mut usize, *mut usize) {
+        let tramp = self.entry_trampoline(n);
+        self.module.finalize_definitions().unwrap();
+        unsafe {
+            core::mem::transmute::<_, unsafe extern "C" fn(usize, *const u8, *mut usize, *mut usize)>(
+                self.module.get_finalized_function(tramp),
+            )
+        }
+    }
+    fn exit_trampoline_finalized(&mut self, m: usize) -> usize {
+        let tramp = self.exit_trampoline(m);
+        self.module.finalize_definitions().unwrap();
+        self.module.get_finalized_function(tramp) as usize
+    }
 }
+
 pub fn main() {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -1000,8 +1044,8 @@ pub fn main() {
         .finish(settings::Flags::new(flag_builder))
         .unwrap();
     let mut builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
-    builder.symbol("alloc", alloc as *const _);
-    builder.symbol("free", free as *const _);
+    builder.symbol("alloc", alloc_abi_compatible as *const _);
+    builder.symbol("free", free_abi_compatible as *const _);
 
     let mut module = JITModule::new(builder);
 
@@ -1033,11 +1077,13 @@ pub fn main() {
         pre_ctx: Default::default(),
         alloc: Some(alloc_func_id),
         free: Some(free_func_id),
+        entry_trampolines: HashMap::new(),
+        exit_trampolines: HashMap::new(),
     };
     // (par () (" ") ((name . "b") (type . unit)) (cut (var . "a") (var . "b")))
 
     let mut closure: Expression =
-        Expression::from_lexpr(&lexpr::from_str(include_str!("../dup3.l")).unwrap()).unwrap();
+        Expression::from_lexpr(&lexpr::from_str(include_str!("../boolean.l")).unwrap()).unwrap();
 
     println!("{closure:#?}");
 
@@ -1045,36 +1091,37 @@ pub fn main() {
     let Expression::CompiledChannel(captures, func_id, typ) = closure else {
         unreachable!()
     };
-
-    type Allocator = i64;
-    let func_id = compiler.sysv_to_internal_entry_point::<1, 2>(&func_id);
     compiler.module.finalize_definitions().unwrap();
+    let func_addr = compiler.module.get_finalized_function(func_id);
 
-    let func = unsafe {
-        // Allocator, their_captures, return_buffer, in0, in1
-        std::mem::transmute::<_, extern "C" fn(Allocator, *const u8, *mut [i64; 3], i64)>(
-            compiler.module.get_finalized_function(func_id),
-        )
+    let vm_ctx_inner = VMCtxInner::new(&mut compiler);
+    let vm_ctx = VMCtx::new(&vm_ctx_inner);
+    let h_type = Type::Dual(Box::new(typ.clone()));
+    let Type::Dual(box Type::Pair(box a, box Type::Pair(box b, box Type::Dual(box c)))) = typ
+    else {
+        unreachable!()
     };
 
-    pub type InputType = LangBox<Result<(), ()>>;
-    pub type OutputType = LangBox<Result<(), ()>>;
+    for i in 0..4 {
+        let captures = 0;
+        let root_handle = unsafe {
+            RawHandle::new(
+                vm_ctx,
+                vec![abi::Value(func_addr as usize), abi::Value(captures)],
+                h_type.clone(),
+            )
+        };
+        let (mut handle, cb) = unsafe { RawHandle::callback(vm_ctx, c.clone()) };
+        let i0 = (i & 2) != 0;
+        let i1 = (i & 1) != 0;
+        handle.sent(RawHandle::unit(vm_ctx).signaled(i0, Type::Unit));
+        handle.sent(RawHandle::unit(vm_ctx).signaled(i1, Type::Unit));
+        let (r_cb, r_args) = unsafe { root_handle.cut(handle) };
 
-    let allocator = 0;
-    use crate::abi::Abi;
-    let input_value = LangBox::new(Result::<(), ()>::Err(()));
-    let mut input_buffer = vec![0usize; InputType::size()].into_boxed_slice();
-    input_value.serialize(&mut input_buffer).unwrap();
-    let mut output_buffer = vec![0usize; OutputType::size()].into_boxed_slice();
-    let mut output_buffer = output_buffer.as_mut_ptr();
-    func(
-        allocator,
-        0 as _,
-        output_buffer as _,
-        input_buffer[0] as i64,
-    );
-    let mut output_buffer =
-        unsafe { std::slice::from_raw_parts(output_buffer, OutputType::size() + 1) };
-    let output = unsafe { OutputType::deserialize(&output_buffer[1..]) };
-    println!("{:?}", output);
+        assert!(r_cb == cb); // we don't have any other callbacks
+        let mut h = unsafe { RawHandle::new(vm_ctx, r_args, c.clone()) };
+        let o = h.r#match();
+        println!("f({i0}, {i1}) = {o}");
+        h.r#continue();
+    }
 }
